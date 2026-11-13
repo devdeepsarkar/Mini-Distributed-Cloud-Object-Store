@@ -94,6 +94,82 @@ async def put_object(f, name, ctype, custom):
     return oid
 
 
+# ---------- download ----------
+
+async def good_copy(c):
+    """Return (bytes, worker id) of a copy that passes its checksum.
+
+    Bad copies found on the way are flagged so the repair loop fixes them.
+    """
+    reps = db.q(
+        "select r.wid, w.url from replicas r join workers w on w.id=r.wid "
+        "where r.cid=? and r.state='ok' and w.status='alive'", c["id"],
+    )
+    random.shuffle(reps)
+    reps.sort(key=lambda r: workers.shaky(r["wid"]))  # workers that just failed go last
+    for r in reps:
+        try:
+            data = await workers.fetch(r["url"], c["id"])
+        except workers.Gone:
+            db.x("delete from replicas where cid=? and wid=?", c["id"], r["wid"])
+            events.add("missing", f"chunk {c['id']} is missing on {r['wid']}")
+            continue
+        except httpx.HTTPError:
+            workers.flag(r["wid"])  # down or hung; the heartbeat timeout will settle which
+            continue
+        if sha(data) != c["checksum"]:
+            db.x("update replicas set state='corrupt' where cid=? and wid=?", c["id"], r["wid"])
+            events.add("corrupt", f"chunk {c['id']} on {r['wid']} failed its checksum, using another copy")
+            continue
+        return data, r["wid"]
+    return None, None
+
+
+def span(o, lo, hi):
+    """The chunks that hold bytes lo..hi, each with the offset of its first byte."""
+    out, pos = [], 0
+    for c in db.q("select * from chunks where oid=? order by idx", o["id"]):
+        if pos + c["size"] > lo and pos <= hi:
+            out.append((c, pos))
+        pos += c["size"]
+    return out
+
+
+def check_readable(o, lo, hi):
+    if o["state"] != "ready":
+        raise Conflict(f"object is {o['state']}")
+    need = [c["id"] for c, _ in span(o, lo, hi)]
+    lost = [r["id"] for r in db.q(
+        "select c.id from chunks c where c.oid=? and not exists("
+        "select 1 from replicas r join workers w on w.id=r.wid "
+        "where r.cid=c.id and r.state='ok' and w.status='alive')", o["id"],
+    ) if r["id"] in need]
+    if lost:
+        why = " (controller is still collecting chunk locations)" if state.safe["on"] else ""
+        raise Unavailable(f"{len(lost)} chunk(s) have no reachable healthy copy{why}")
+
+
+readers = {}  # object id -> downloads in progress, so a delete cannot cut one off
+
+
+async def stream(o, lo, hi):
+    """Yield bytes lo..hi of the object. Only the chunks in that range are read."""
+    oid = o["id"]
+    readers[oid] = readers.get(oid, 0) + 1
+    try:
+        for c, pos in span(o, lo, hi):
+            data, _ = await good_copy(c)
+            if data is None:
+                raise Unavailable(f"chunk {c['idx']} has no reachable healthy copy")
+            part = data[max(lo - pos, 0): hi - pos + 1]  # whole chunk verified, slice sent
+            metrics.BYTES_OUT.inc(len(part))
+            yield part
+    finally:
+        readers[oid] -= 1
+        if not readers[oid]:
+            del readers[oid]
+
+
 # ---------- delete ----------
 
 async def purge(oid):
