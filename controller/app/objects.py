@@ -188,3 +188,13 @@ async def purge(oid):
     state.changed()
 
 
+async def delete_object(o):
+    writable()
+    if o["state"] != "ready":
+        raise Conflict(f"object is {o['state']}")
+    if readers.get(o["id"]):
+        raise Conflict("object is being downloaded right now, try again when the download has finished")
+    await purge(o["id"])
+    events.add("delete", f"{o['name']} ({o['id']}) deleted")
+
+
