@@ -1,0 +1,137 @@
+# 1 controller + 4 storage workers, each worker with its own persistent volume.
+#
+#   docker compose up --build -d
+#   open http://localhost:8000
+#
+# The client container is optional:
+#   docker compose run --rm client upload /files/photo.jpg
+
+name: mini-object-store
+
+x-worker: &worker
+  build: ./worker
+  restart: "no"          # so `docker stop workerN` keeps it down for the demo
+  depends_on:
+    - controller
+  networks:
+    - store
+
+services:
+  controller:
+    build: ./controller
+    container_name: controller
+    ports:
+      - "8000:8000"
+    environment:
+      CHUNK_SIZE: 1048576        # 1 MB
+      REPLICATION_FACTOR: 2
+      HEARTBEAT_TIMEOUT: 10      # seconds of silence before a worker is dead
+      REPAIR_INTERVAL: 5         # how often replication is checked and fixed
+      SCRUB_INTERVAL: 30         # how often every chunk is re-hashed on disk
+      BACKUP_INTERVAL: 5         # metadata is copied to the backup volume after changes
+      SAFE_MODE_TIMEOUT: 15      # after a start, wait this long for workers to report
+    volumes:
+      - controller-data:/data
+      - controller-backup:/backup   # second copy of the metadata database
+    networks:
+      - store
+
+  worker1:
+    <<: *worker
+    container_name: worker1
+    ports:
+      - "127.0.0.1:8001:8001"   # only so Postman can reach the internal API
+    environment:
+      WORKER_ID: worker1
+      CONTROLLER_URL: http://controller:8000
+    volumes:
+      - worker1-data:/data
+
+  worker2:
+    <<: *worker
+    container_name: worker2
+    ports:
+      - "127.0.0.1:8002:8001"   # only so Postman can reach the internal API
+    environment:
+      WORKER_ID: worker2
+      CONTROLLER_URL: http://controller:8000
+    volumes:
+      - worker2-data:/data
+
+  worker3:
+    <<: *worker
+    container_name: worker3
+    ports:
+      - "127.0.0.1:8003:8001"   # only so Postman can reach the internal API
+    environment:
+      WORKER_ID: worker3
+      CONTROLLER_URL: http://controller:8000
+    volumes:
+      - worker3-data:/data
+
+  worker4:
+    <<: *worker
+    container_name: worker4
+    ports:
+      - "127.0.0.1:8004:8001"   # only so Postman can reach the internal API
+    environment:
+      WORKER_ID: worker4
+      CONTROLLER_URL: http://controller:8000
+    volumes:
+      - worker4-data:/data
+
+  client:
+    build: ./client
+    profiles: ["tools"]          # only runs when asked for
+    environment:
+      OS_URL: http://controller:8000
+    volumes:
+      - ./files:/files
+    networks:
+      - store
+
+  # Optional monitoring:  docker compose --profile monitoring up -d
+  #   Grafana     http://localhost:3000   (no login needed)
+  #   Prometheus  http://localhost:9090
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: prometheus
+    profiles: ["monitoring"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - store
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: grafana
+    profiles: ["monitoring"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/object-store.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - store
+
+volumes:
+  controller-data:
+  controller-backup:
+  worker1-data:
+  worker2-data:
+  worker3-data:
+  worker4-data:
+
+networks:
+  store:
