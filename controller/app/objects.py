@@ -198,3 +198,80 @@ async def delete_object(o):
     events.add("delete", f"{o['name']} ({o['id']}) deleted")
 
 
+# ---------- views ----------
+
+def etag(o):
+    """Changes only when the object's bytes change (they never do after upload)."""
+    return f'"{o["checksum"]}"'
+
+
+def meta_etag(o):
+    """Changes on every metadata update; used for If-Match on PATCH and DELETE."""
+    return f'"v{o["version"]}"'
+
+
+def brief(o):
+    return {
+        "object_id": o["id"],
+        "name": o["name"],
+        "size": o["size"],
+        "content_type": o["ctype"],
+        "created_at": o["created"],
+        "chunk_count": o["nchunks"],
+    }
+
+
+def meta(o):
+    reps = {}
+    for r in db.q(
+        "select r.cid, r.wid, r.state, w.status from replicas r "
+        "join chunks c on c.id=r.cid join workers w on w.id=r.wid "
+        "where c.oid=? order by r.wid", o["id"],
+    ):
+        reps.setdefault(r["cid"], []).append(
+            {"worker": r["wid"], "state": r["state"], "alive": r["status"] == "alive"}
+        )
+    chunks = []
+    for c in db.q("select * from chunks where oid=? order by idx", o["id"]):
+        rs = reps.get(c["id"], [])
+        chunks.append({
+            "chunk_id": c["id"],
+            "index": c["idx"],
+            "size": c["size"],
+            "checksum": c["checksum"],
+            "healthy_copies": sum(r["alive"] and r["state"] == "ok" for r in rs),
+            "replicas": rs,
+        })
+    return {
+        "object_id": o["id"],
+        "name": o["name"],
+        "size": o["size"],
+        "content_type": o["ctype"],
+        "created_at": o["created"],
+        "modified_at": o["modified"],
+        "checksum": o["checksum"],
+        "checksum_algorithm": "sha256",
+        "chunk_count": o["nchunks"],
+        "chunk_size": config.CHUNK,
+        "state": o["state"],
+        "etag": etag(o),
+        "metadata_version": o["version"],
+        "metadata_etag": meta_etag(o),
+        "custom_metadata": json.loads(o["custom"]),
+        "chunks": chunks,
+    }
+
+
+def patch_custom(o, kv):
+    """Merge keys into the custom metadata. A null value removes the key."""
+    cur = json.loads(o["custom"])
+    for k, v in kv.items():
+        if v is None:
+            cur.pop(k, None)
+        else:
+            cur[k] = v
+    db.x(
+        "update objects set custom=?, modified=?, version=version+1 where id=?",
+        json.dumps(cur), now(), o["id"],
+    )
+    state.changed()
