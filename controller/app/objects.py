@@ -125,6 +125,31 @@ async def good_copy(c):
     return None, None
 
 
+def parse_range(h, size):
+    """Turn a Range header into (first, last) byte positions, both inclusive.
+
+    Returns None when the whole object should be sent. Only a single
+    'bytes=' range is supported; anything else is ignored, as HTTP allows.
+    """
+    if not h or not h.startswith("bytes=") or "," in h:
+        return None
+    a, _, b = h[6:].strip().partition("-")
+    try:
+        if a == "":              # bytes=-500 means the last 500 bytes
+            n = int(b)
+            if n <= 0:
+                raise BadRange(size)
+            lo, hi = max(size - n, 0), size - 1
+        else:
+            lo = int(a)
+            hi = int(b) if b else size - 1
+    except ValueError:
+        return None
+    if lo >= size or lo > hi:
+        raise BadRange(size)
+    return lo, min(hi, size - 1)
+
+
 def span(o, lo, hi):
     """The chunks that hold bytes lo..hi, each with the offset of its first byte."""
     out, pos = [], 0
