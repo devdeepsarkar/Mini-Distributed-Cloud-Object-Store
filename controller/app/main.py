@@ -70,6 +70,60 @@ PATCH_BODY = {"requestBody": {"required": True, "content": {"application/json": 
 }}}}
 
 
+# ---------- errors: always {"error": {"code", "message"}} ----------
+
+def err(status, code, msg):
+    return JSONResponse({"error": {"code": code, "message": msg}}, status)
+
+
+@app.exception_handler(HTTPException)
+async def on_http(req, e):
+    codes = {400: "bad_request", 404: "not_found", 405: "method_not_allowed", 409: "conflict",
+             412: "precondition_failed"}
+    return err(e.status_code, codes.get(e.status_code, "error"), str(e.detail))
+
+
+@app.exception_handler(RequestValidationError)
+async def on_invalid(req, e):
+    first = e.errors()[0]
+    where = ".".join(str(p) for p in first["loc"][1:])
+    return err(400, "bad_request", f"{where}: {first['msg']}" if where else first["msg"])
+
+
+@app.exception_handler(objects.Unavailable)
+async def on_unavailable(req, e):
+    return err(503, "storage_unavailable", str(e))
+
+
+@app.exception_handler(objects.Conflict)
+async def on_conflict(req, e):
+    return err(409, "conflict", str(e))
+
+
+@app.exception_handler(objects.BadRange)
+async def on_bad_range(req, e):
+    r = err(416, "range_not_satisfiable", f"the object is {e.size} bytes long")
+    r.headers["Content-Range"] = f"bytes */{e.size}"
+    return r
+
+
+@app.exception_handler(Exception)
+async def on_crash(req, e):
+    log.exception("unhandled error")
+    return err(500, "internal_error", "internal server error")
+
+
+@app.middleware("http")
+async def timing(req, call_next):
+    t = time.perf_counter()
+    resp = await call_next(req)
+    route = req.scope.get("route")
+    path = route.path if route else "other"
+    if path.startswith("/api/"):
+        metrics.LATENCY.labels(req.method, path, resp.status_code).observe(time.perf_counter() - t)
+    return resp
+
+
 def tag_matches(header, *tags):
     """Does an If-Match / If-None-Match header name one of these ETags?"""
     if header is None:
