@@ -59,8 +59,217 @@ app = FastAPI(
     lifespan=life,
 )
 
+C = "Client API"
 A = "Admin and monitoring"
 I = "Internal API (workers to controller)"
+
+# Documentation only: lets the docs page offer a JSON editor for PATCH metadata.
+PATCH_BODY = {"requestBody": {"required": True, "content": {"application/json": {
+    "schema": {"type": "object", "additionalProperties": True},
+    "example": {"owner": "devdeep", "reviewed": "yes", "old_key": None},
+}}}}
+
+
+# ---------- errors: always {"error": {"code", "message"}} ----------
+
+def err(status, code, msg):
+    return JSONResponse({"error": {"code": code, "message": msg}}, status)
+
+
+@app.exception_handler(HTTPException)
+async def on_http(req, e):
+    codes = {400: "bad_request", 404: "not_found", 405: "method_not_allowed", 409: "conflict",
+             412: "precondition_failed"}
+    return err(e.status_code, codes.get(e.status_code, "error"), str(e.detail))
+
+
+@app.exception_handler(RequestValidationError)
+async def on_invalid(req, e):
+    first = e.errors()[0]
+    where = ".".join(str(p) for p in first["loc"][1:])
+    return err(400, "bad_request", f"{where}: {first['msg']}" if where else first["msg"])
+
+
+@app.exception_handler(objects.Unavailable)
+async def on_unavailable(req, e):
+    return err(503, "storage_unavailable", str(e))
+
+
+@app.exception_handler(objects.Conflict)
+async def on_conflict(req, e):
+    return err(409, "conflict", str(e))
+
+
+@app.exception_handler(objects.BadRange)
+async def on_bad_range(req, e):
+    r = err(416, "range_not_satisfiable", f"the object is {e.size} bytes long")
+    r.headers["Content-Range"] = f"bytes */{e.size}"
+    return r
+
+
+@app.exception_handler(Exception)
+async def on_crash(req, e):
+    log.exception("unhandled error")
+    return err(500, "internal_error", "internal server error")
+
+
+@app.middleware("http")
+async def timing(req, call_next):
+    t = time.perf_counter()
+    resp = await call_next(req)
+    route = req.scope.get("route")
+    path = route.path if route else "other"
+    if path.startswith("/api/"):
+        metrics.LATENCY.labels(req.method, path, resp.status_code).observe(time.perf_counter() - t)
+    return resp
+
+
+def tag_matches(header, *tags):
+    """Does an If-Match / If-None-Match header name one of these ETags?"""
+    if header is None:
+        return False
+    given = [t.strip().removeprefix("W/") for t in header.split(",")]
+    return "*" in given or any(t in given for t in tags)
+
+
+def must_match(req, o, *tags):
+    """Optimistic locking: with If-Match, the caller's copy must be the current one."""
+    h = req.headers.get("if-match")
+    if h is not None and not tag_matches(h, *tags):
+        raise HTTPException(412, f"object changed since you read it, current ETag is {objects.meta_etag(o)}")
+
+
+def find(oid):
+    o = db.one("select * from objects where id=?", oid)
+    if o is None:
+        raise HTTPException(404, f"object {oid} not found")
+    return o
+
+
+# ---------- client API ----------
+
+@app.post("/api/v1/objects", status_code=201, tags=[C], summary="Upload an object")
+async def upload(resp: Response, file: UploadFile = File(...), metadata: str | None = Form(None)):
+    custom = {}
+    if metadata:
+        try:
+            custom = json.loads(metadata)
+        except ValueError:
+            raise HTTPException(400, "metadata must be valid JSON")
+        if not isinstance(custom, dict):
+            raise HTTPException(400, "metadata must be a JSON object of key-value pairs")
+
+    name = file.filename or "unnamed"
+    ctype = file.content_type
+    if not ctype or ctype == "application/octet-stream":
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+    oid = await objects.put_object(file, name, ctype, custom)
+    resp.headers["Location"] = f"/api/v1/objects/{oid}"
+    return objects.meta(find(oid))
+
+
+@app.get("/api/v1/objects", tags=[C], summary="List stored objects")
+def list_objects(limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
+    rows = db.q(
+        "select * from objects where state='ready' order by created desc, id limit ? offset ?",
+        limit, offset,
+    )
+    total = db.one("select count(*) n from objects where state='ready'")["n"]
+    return {"objects": [objects.brief(o) for o in rows], "total": total, "limit": limit, "offset": offset}
+
+
+def object_headers(o, inline):
+    kind = "inline" if inline else "attachment"
+    return {
+        "Content-Disposition": f"{kind}; filename*=UTF-8''{quote(o['name'])}",
+        "ETag": objects.etag(o),
+        "Accept-Ranges": "bytes",
+        "Last-Modified": formatdate(datetime.fromisoformat(o["created"]).timestamp(), usegmt=True),
+    }
+
+
+@app.head("/api/v1/objects/{oid}", tags=[C], summary="Object size and headers, no body")
+def head(oid: str, inline: bool = False):
+    o = find(oid)
+    return Response(media_type=o["ctype"], headers={**object_headers(o, inline), "Content-Length": str(o["size"])})
+
+
+@app.get("/api/v1/objects/{oid}", tags=[C], summary="Download an object")
+async def download(oid: str, req: Request, inline: bool = False):
+    o = find(oid)
+    hd = object_headers(o, inline)
+
+    # the caller already has these exact bytes
+    if tag_matches(req.headers.get("if-none-match"), objects.etag(o)):
+        return Response(status_code=304, headers=hd)
+
+    # Range: bytes=a-b -> 206 with only that part, read from only the chunks it touches
+    rng = objects.parse_range(req.headers.get("range"), o["size"])
+    lo, hi = rng or (0, o["size"] - 1)
+    objects.check_readable(o, lo, hi)
+    status = 200
+    if rng:
+        status = 206
+        hd["Content-Range"] = f"bytes {lo}-{hi}/{o['size']}"
+        cs = objects.span(o, lo, hi)
+        events.add("range", f"{o['name']}: bytes {lo}-{hi} read from chunk(s) "
+                            f"{cs[0][0]['idx']}-{cs[-1][0]['idx']} of {o['nchunks']}")
+    hd["Content-Length"] = str(hi - lo + 1)
+
+    # pull the first chunk before answering, so a dead object gives a clean 503
+    gen = objects.stream(o, lo, hi)
+    try:
+        first = await anext(gen)
+    except StopAsyncIteration:
+        first = b""
+
+    async def body():
+        yield first
+        async for buf in gen:
+            yield buf
+
+    return StreamingResponse(body(), status_code=status, media_type=o["ctype"], headers=hd)
+
+
+@app.get("/api/v1/objects/{oid}/metadata", tags=[C], summary="Retrieve metadata")
+def get_meta(oid: str, resp: Response):
+    o = find(oid)
+    # The ETag is the metadata version, for If-Match on PATCH and DELETE. It is
+    # not a cache validator: the body also lists chunk locations, which change
+    # during repairs without a version bump, so this must never be cached.
+    resp.headers["ETag"] = objects.meta_etag(o)
+    resp.headers["Cache-Control"] = "no-store"
+    return objects.meta(o)
+
+
+@app.patch("/api/v1/objects/{oid}/metadata", tags=[C], summary="Update custom metadata", openapi_extra=PATCH_BODY)
+async def patch_meta(oid: str, req: Request, resp: Response):
+    find(oid)
+    try:
+        kv = await req.json()
+    except ValueError:
+        raise HTTPException(400, "body must be valid JSON")
+    if not isinstance(kv, dict):
+        raise HTTPException(400, "body must be a JSON object of key-value pairs")
+    # from here to the update nothing awaits, so check-then-write is atomic
+    o = find(oid)
+    if o["state"] != "ready":
+        raise objects.Conflict(f"object is {o['state']}")
+    must_match(req, o, objects.meta_etag(o))
+    objects.patch_custom(o, kv)
+    o = find(oid)
+    resp.headers["ETag"] = objects.meta_etag(o)
+    return objects.meta(o)
+
+
+@app.delete("/api/v1/objects/{oid}", status_code=204, tags=[C], summary="Delete an object")
+async def delete(oid: str, req: Request):
+    o = find(oid)
+    must_match(req, o, objects.meta_etag(o), objects.etag(o))
+    await objects.delete_object(o)
+    return Response(status_code=204)
+
 
 # ---------- cluster view (dashboard, CLI, demo) ----------
 
@@ -122,6 +331,11 @@ def healthz():
         "mode": "recovering" if state.safe["on"] else "normal",
         "live_workers": len(workers.alive()),
     }
+
+
+@app.get("/", include_in_schema=False)
+def dashboard():
+    return FileResponse(HERE / "static" / "index.html")
 
 
 # ---------- internal API (workers -> controller) ----------
